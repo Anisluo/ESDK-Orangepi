@@ -692,6 +692,12 @@ static void setupRoutes(httplib::Server& srv) {
         std::string msg = body.substr(q1 + 1, q2 - q1 - 1);
         if (msg.size() > 256) msg = msg.substr(0, 256);
 
+        if (!g_state.sdk_init_ok) {
+            res.set_content(
+                "{\"ok\":false,\"error\":\"sdk not initialised\"}",
+                "application/json");
+            return;
+        }
         auto rc = CloudAPI_SendCustomEventsMessage(
             reinterpret_cast<const uint8_t*>(msg.c_str()), msg.size());
         if (rc == kOk) {
@@ -705,10 +711,11 @@ static void setupRoutes(httplib::Server& srv) {
 
     // Media file list
     srv.Get("/api/media", [](const httplib::Request&, httplib::Response& res) {
-        // Refresh from SDK
-        {
+        // Only refresh from SDK once it's initialised — calling the
+        // MediaManager before ESDKInit succeeds segfaults inside the lib.
+        if (g_state.sdk_init_ok) {
             auto reader = MediaManager::Instance()->CreateMediaFilesReader();
-            if (reader->Init() == kOk) {
+            if (reader && reader->Init() == kOk) {
                 MediaFilesReader::MediaFileList list;
                 int n = reader->FileList(list);
                 if (n > 0) {
