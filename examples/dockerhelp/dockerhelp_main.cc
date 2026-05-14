@@ -3,9 +3,15 @@
  * Web-based debug dashboard for DJI Edge SDK
  * Access via browser: http://localhost:8080
  */
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <mutex>
@@ -26,9 +32,30 @@ ErrorCode ESDKInit();
 
 // ─── Global State ────────────────────────────────────────────────────────────
 
+struct DockStatus {
+    bool        valid       = false;
+    bool        from_mock   = false;
+    std::string updated_at;          // "HH:MM:SS"
+    std::string dock_sn;
+    std::string aircraft_sn;
+    int         battery_pct = -1;    // 0..100
+    double      temperature = 0.0;   // ℃
+    int         humidity    = -1;    // 0..100
+    double      wind_speed  = 0.0;   // m/s
+    int         rainfall    = -1;    // 0=none 1=light 2=mid 3=heavy
+    double      longitude   = 0.0;
+    double      latitude    = 0.0;
+    double      altitude    = 0.0;
+    std::string mode;                // "idle" / "working" / "charging" ...
+    int         cover_state = -1;    // 0=closed 1=open 2=half
+    int         signal_4g   = -1;    // 0..5 bars
+};
+
 struct AppState {
     std::atomic<bool>        sdk_connected{false};
     std::atomic<bool>        sdk_init_ok{false};
+    std::atomic<bool>        sdk_init_pending{true};
+    std::atomic<int>         sdk_init_error{0};
     std::string              last_cloud_msg;
     std::mutex               log_mutex;
     std::deque<std::string>  log_lines;       // rolling 200 lines
@@ -37,6 +64,9 @@ struct AppState {
 
     std::vector<std::string> media_file_names;
     std::mutex               media_mutex;
+
+    DockStatus               dock;
+    std::mutex               dock_mutex;
 
     void pushLog(const std::string& line) {
         std::lock_guard<std::mutex> lk(log_mutex);
@@ -62,10 +92,13 @@ struct AppState {
 
 // ─── ESDK Callbacks ──────────────────────────────────────────────────────────
 
+static void applyDockJson(const std::string& payload);  // defined below
+
 void OnCloudMessage(const uint8_t* data, uint32_t len) {
     std::string msg(reinterpret_cast<const char*>(data), len);
     g_state.pushLog("[Cloud←Dock] " + msg);
     g_state.pushCloud(msg);
+    applyDockJson(msg);
 }
 
 ErrorCode OnNewMediaFile(const MediaFile& f) {
@@ -75,6 +108,129 @@ ErrorCode OnNewMediaFile(const MediaFile& f) {
     std::lock_guard<std::mutex> lk(g_state.media_mutex);
     g_state.media_file_names.push_back(info);
     return kOk;
+}
+
+// ─── Minimal JSON field extraction (no external deps) ────────────────────────
+// Cloud payload contract (you decide what your cloud-side bridge sends):
+//   {"type":"dock_osd",
+//    "dock_sn":"...","aircraft_sn":"...",
+//    "battery":85,"temperature":24.5,"humidity":60,
+//    "wind_speed":3.4,"rainfall":0,
+//    "lon":113.93,"lat":22.53,"alt":12.3,
+//    "mode":"idle","cover":0,"signal_4g":4}
+// Unknown / missing fields stay at their default values.
+
+static bool jsonFindKey(const std::string& s, const std::string& key,
+                        size_t* value_start) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = s.find(needle);
+    if (p == std::string::npos) return false;
+    p = s.find(':', p + needle.size());
+    if (p == std::string::npos) return false;
+    p++;
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) p++;
+    *value_start = p;
+    return p < s.size();
+}
+
+static bool jsonGetString(const std::string& s, const std::string& key,
+                          std::string* out) {
+    size_t p;
+    if (!jsonFindKey(s, key, &p)) return false;
+    if (s[p] != '"') return false;
+    size_t end = p + 1;
+    while (end < s.size() && s[end] != '"') {
+        if (s[end] == '\\' && end + 1 < s.size()) end += 2;
+        else end++;
+    }
+    if (end >= s.size()) return false;
+    *out = s.substr(p + 1, end - p - 1);
+    return true;
+}
+
+static bool jsonGetNumber(const std::string& s, const std::string& key,
+                          double* out) {
+    size_t p;
+    if (!jsonFindKey(s, key, &p)) return false;
+    if (s[p] == '"') return false;  // we want numbers, not strings
+    char* endp = nullptr;
+    double v = std::strtod(s.c_str() + p, &endp);
+    if (endp == s.c_str() + p) return false;
+    *out = v;
+    return true;
+}
+
+static void applyDockJson(const std::string& payload) {
+    std::string s;  // probe a "type" field to confirm this is a status payload
+    if (!jsonGetString(payload, "type", &s)) return;
+    if (s != "dock_osd" && s != "dock_status") return;
+
+    std::lock_guard<std::mutex> lk(g_state.dock_mutex);
+    DockStatus& d = g_state.dock;
+    d.valid = true;
+    d.from_mock = false;
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[20];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+    d.updated_at = buf;
+
+    std::string sv;
+    if (jsonGetString(payload, "dock_sn", &sv))     d.dock_sn = sv;
+    if (jsonGetString(payload, "aircraft_sn", &sv)) d.aircraft_sn = sv;
+    if (jsonGetString(payload, "mode", &sv))        d.mode = sv;
+
+    double nv;
+    if (jsonGetNumber(payload, "battery", &nv))     d.battery_pct = (int)nv;
+    if (jsonGetNumber(payload, "temperature", &nv)) d.temperature = nv;
+    if (jsonGetNumber(payload, "humidity", &nv))    d.humidity = (int)nv;
+    if (jsonGetNumber(payload, "wind_speed", &nv))  d.wind_speed = nv;
+    if (jsonGetNumber(payload, "rainfall", &nv))    d.rainfall = (int)nv;
+    if (jsonGetNumber(payload, "lon", &nv))         d.longitude = nv;
+    if (jsonGetNumber(payload, "lat", &nv))         d.latitude = nv;
+    if (jsonGetNumber(payload, "alt", &nv))         d.altitude = nv;
+    if (jsonGetNumber(payload, "cover", &nv))       d.cover_state = (int)nv;
+    if (jsonGetNumber(payload, "signal_4g", &nv))   d.signal_4g = (int)nv;
+}
+
+// ─── Network diagnostics (look for 192.168.200.x iface and ping Dock) ────────
+
+struct NetInfo {
+    std::string iface;
+    std::string ip;
+    bool        in_dock_subnet = false;
+    bool        dock_pingable  = false;   // ping 192.168.200.100 once
+};
+
+static NetInfo collectNetInfo() {
+    NetInfo info;
+    ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) == 0) {
+        std::string fallback_iface, fallback_ip;
+        for (ifaddrs* p = ifs; p; p = p->ifa_next) {
+            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+            auto* sin = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
+            char buf[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+            std::string name = p->ifa_name ? p->ifa_name : "";
+            std::string ip   = buf;
+            if (name == "lo") continue;
+            if (ip.rfind("192.168.200.", 0) == 0) {
+                info.iface = name;
+                info.ip = ip;
+                info.in_dock_subnet = true;
+                break;
+            }
+            if (fallback_iface.empty()) { fallback_iface = name; fallback_ip = ip; }
+        }
+        if (info.iface.empty()) { info.iface = fallback_iface; info.ip = fallback_ip; }
+        freeifaddrs(ifs);
+    }
+    // single-shot ping; 1s timeout
+    int rc = std::system("ping -c 1 -W 1 192.168.200.100 >/dev/null 2>&1");
+    info.dock_pingable = (rc == 0);
+    return info;
 }
 
 // ─── HTML Page (single-page, self-contained) ─────────────────────────────────
@@ -158,6 +314,51 @@ header h1{font-size:18px;font-weight:600;letter-spacing:.5px}
     </div>
   </div>
 
+  <!-- Dock 状态 -->
+  <div class="card" style="grid-column:1/-1">
+    <div class="card-header">
+      <h2>机场状态 (Dock OSD)</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="dock-updated" style="font-size:11px;color:#8b949e">—</span>
+        <button class="btn btn-primary btn-sm" onclick="injectMock()">注入示例数据</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div id="dock-empty" style="padding:14px;text-align:center;color:#484f58;font-size:13px">
+        暂无数据。等待云端通过 ESDK 自定义透传下发 {"type":"dock_osd",...} 消息，
+        或点击「注入示例数据」预览界面。
+      </div>
+      <div id="dock-grid" class="stat-row" style="display:none">
+        <div class="stat"><div class="val" id="d-bat">—</div><div class="lbl">电量 %</div></div>
+        <div class="stat"><div class="val" id="d-temp">—</div><div class="lbl">温度 ℃</div></div>
+        <div class="stat"><div class="val" id="d-hum">—</div><div class="lbl">湿度 %</div></div>
+        <div class="stat"><div class="val" id="d-wind">—</div><div class="lbl">风速 m/s</div></div>
+        <div class="stat"><div class="val" id="d-rain">—</div><div class="lbl">降雨</div></div>
+        <div class="stat"><div class="val" id="d-cov">—</div><div class="lbl">舱门</div></div>
+        <div class="stat"><div class="val" id="d-sig">—</div><div class="lbl">4G 信号</div></div>
+        <div class="stat"><div class="val" id="d-mode">—</div><div class="lbl">模式</div></div>
+      </div>
+      <div id="dock-extra" style="display:none;font-size:12px;color:#8b949e;line-height:2;margin-top:10px">
+        <div>Dock SN：<span style="color:#e6edf3" id="d-dsn">—</span></div>
+        <div>飞机 SN：<span style="color:#e6edf3" id="d-asn">—</span></div>
+        <div>经/纬/海拔：<span style="color:#e6edf3" id="d-pos">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 网络诊断 -->
+  <div class="card">
+    <div class="card-header"><h2>网络诊断</h2><button class="btn btn-primary btn-sm" onclick="fetchNet()">重新检测</button></div>
+    <div class="card-body">
+      <div style="font-size:12px;color:#8b949e;line-height:2">
+        <div>本机网卡：<span style="color:#e6edf3" id="n-iface">—</span></div>
+        <div>本机 IP：<span style="color:#e6edf3" id="n-ip">—</span></div>
+        <div>是否在 Dock 网段 (192.168.200.x)：<span id="n-subnet">—</span></div>
+        <div>能否 ping 通 Dock (192.168.200.100)：<span id="n-ping">—</span></div>
+      </div>
+    </div>
+  </div>
+
   <!-- 云消息发送 -->
   <div class="card">
     <div class="card-header"><h2>云消息通道</h2></div>
@@ -218,11 +419,17 @@ async function fetchStatus(){
       badge.textContent='SDK 已初始化';
       badge.className='badge ok';
       badge.classList.remove('pulse');
-    } else {
-      badge.textContent='连接中...';
+    } else if(d.sdk_init_pending){
+      badge.textContent='SDK 初始化中…';
       badge.className='badge warn pulse';
+    } else {
+      badge.textContent='SDK 初始化失败 (err '+d.sdk_init_error+')';
+      badge.className='badge err';
+      badge.classList.remove('pulse');
     }
-    document.getElementById('stat-conn').textContent = d.sdk_init_ok ? '✓ 已连接' : '⏳ 等待';
+    document.getElementById('stat-conn').textContent =
+      d.sdk_init_ok ? '✓ 已连接'
+                    : (d.sdk_init_pending ? '⏳ 等待' : '✗ 失败');
     document.getElementById('stat-files').textContent = d.media_count;
     document.getElementById('stat-msgs').textContent = d.cloud_msg_count;
   }catch(e){}
@@ -298,8 +505,65 @@ function clearLog(){
   document.getElementById('main-log').innerHTML='';
 }
 
+async function fetchDock(){
+  try{
+    const r=await fetch('/api/dock');
+    const d=await r.json();
+    if(!d.valid){
+      document.getElementById('dock-empty').style.display='block';
+      document.getElementById('dock-grid').style.display='none';
+      document.getElementById('dock-extra').style.display='none';
+      document.getElementById('dock-updated').textContent='—';
+      return;
+    }
+    document.getElementById('dock-empty').style.display='none';
+    document.getElementById('dock-grid').style.display='flex';
+    document.getElementById('dock-extra').style.display='block';
+    document.getElementById('dock-updated').textContent =
+      (d.from_mock?'[模拟] ':'') + '更新于 '+d.updated_at;
+    document.getElementById('d-bat').textContent  = d.battery_pct<0?'—':d.battery_pct;
+    document.getElementById('d-temp').textContent = d.temperature.toFixed(1);
+    document.getElementById('d-hum').textContent  = d.humidity<0?'—':d.humidity;
+    document.getElementById('d-wind').textContent = d.wind_speed.toFixed(1);
+    const rainMap = ['无','小雨','中雨','大雨'];
+    document.getElementById('d-rain').textContent = d.rainfall<0?'—':(rainMap[d.rainfall]||d.rainfall);
+    const covMap = ['关闭','开启','半开'];
+    document.getElementById('d-cov').textContent  = d.cover_state<0?'—':(covMap[d.cover_state]||d.cover_state);
+    document.getElementById('d-sig').textContent  = d.signal_4g<0?'—':d.signal_4g;
+    document.getElementById('d-mode').textContent = d.mode||'—';
+    document.getElementById('d-dsn').textContent  = d.dock_sn||'—';
+    document.getElementById('d-asn').textContent  = d.aircraft_sn||'—';
+    document.getElementById('d-pos').textContent  =
+      `${d.longitude.toFixed(6)}, ${d.latitude.toFixed(6)}, ${d.altitude.toFixed(1)} m`;
+  }catch(e){}
+}
+
+async function fetchNet(){
+  try{
+    const r=await fetch('/api/net');
+    const d=await r.json();
+    document.getElementById('n-iface').textContent = d.iface||'(none)';
+    document.getElementById('n-ip').textContent    = d.ip||'(none)';
+    const sn=document.getElementById('n-subnet');
+    sn.textContent = d.in_dock_subnet?'✓ 是':'✗ 否（需配置 192.168.200.x）';
+    sn.style.color = d.in_dock_subnet?'#3fb950':'#f85149';
+    const pg=document.getElementById('n-ping');
+    pg.textContent = d.dock_pingable?'✓ 通':'✗ 不通';
+    pg.style.color = d.dock_pingable?'#3fb950':'#f85149';
+  }catch(e){}
+}
+
+async function injectMock(){
+  try{
+    const r=await fetch('/api/dock/inject',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){ showToast('已注入示例数据'); fetchDock(); }
+    else showToast('注入失败',false);
+  }catch(e){showToast('注入错误',false);}
+}
+
 function refreshAll(){
-  fetchStatus();fetchLogs();fetchCloudMsgs();
+  fetchStatus();fetchLogs();fetchCloudMsgs();fetchDock();
 }
 
 function escHtml(s){
@@ -311,8 +575,11 @@ document.getElementById('msg-input').addEventListener('keydown',e=>{
 });
 
 // Poll every 2s
-setInterval(()=>{fetchStatus();fetchLogs();fetchCloudMsgs();},2000);
+setInterval(()=>{fetchStatus();fetchLogs();fetchCloudMsgs();fetchDock();},2000);
+// Network check is more expensive (runs `ping`), poll slower
+setInterval(fetchNet, 10000);
 refreshAll();
+fetchNet();
 </script>
 </body>
 </html>
@@ -357,6 +624,8 @@ static void setupRoutes(httplib::Server& srv) {
         }
         ss << "{"
            << "\"sdk_init_ok\":" << (g_state.sdk_init_ok ? "true" : "false") << ","
+           << "\"sdk_init_pending\":" << (g_state.sdk_init_pending ? "true" : "false") << ","
+           << "\"sdk_init_error\":" << g_state.sdk_init_error.load() << ","
            << "\"sdk_connected\":" << (g_state.sdk_connected ? "true" : "false") << ","
            << "\"media_count\":" << media_count << ","
            << "\"cloud_msg_count\":" << cloud_count
@@ -465,6 +734,70 @@ static void setupRoutes(httplib::Server& srv) {
         ss << "]}";
         res.set_content(ss.str(), "application/json");
     });
+
+    // Dock status JSON
+    srv.Get("/api/dock", [](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lk(g_state.dock_mutex);
+        const DockStatus& d = g_state.dock;
+        std::ostringstream ss;
+        ss << "{"
+           << "\"valid\":"       << (d.valid ? "true" : "false") << ","
+           << "\"from_mock\":"   << (d.from_mock ? "true" : "false") << ","
+           << "\"updated_at\":"  << jsonStr(d.updated_at) << ","
+           << "\"dock_sn\":"     << jsonStr(d.dock_sn) << ","
+           << "\"aircraft_sn\":" << jsonStr(d.aircraft_sn) << ","
+           << "\"battery_pct\":" << d.battery_pct << ","
+           << "\"temperature\":" << d.temperature << ","
+           << "\"humidity\":"    << d.humidity << ","
+           << "\"wind_speed\":"  << d.wind_speed << ","
+           << "\"rainfall\":"    << d.rainfall << ","
+           << "\"longitude\":"   << d.longitude << ","
+           << "\"latitude\":"    << d.latitude << ","
+           << "\"altitude\":"    << d.altitude << ","
+           << "\"mode\":"        << jsonStr(d.mode) << ","
+           << "\"cover_state\":" << d.cover_state << ","
+           << "\"signal_4g\":"   << d.signal_4g
+           << "}";
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // Inject a sample status payload so the UI can be checked before the Dock
+    // is online. Accepts a custom payload via POST body if you want to test
+    // the JSON parser.
+    srv.Post("/api/dock/inject", [](const httplib::Request& req,
+                                    httplib::Response& res) {
+        std::string payload = req.body;
+        if (payload.empty()) {
+            payload =
+                "{\"type\":\"dock_osd\","
+                "\"dock_sn\":\"5TADKAAAAAAAAA\","
+                "\"aircraft_sn\":\"1581F0AAAAAAAA\","
+                "\"battery\":87,\"temperature\":26.4,\"humidity\":58,"
+                "\"wind_speed\":2.6,\"rainfall\":0,"
+                "\"lon\":113.937412,\"lat\":22.532315,\"alt\":18.5,"
+                "\"mode\":\"idle\",\"cover\":0,\"signal_4g\":4}";
+        }
+        applyDockJson(payload);
+        {
+            std::lock_guard<std::mutex> lk(g_state.dock_mutex);
+            g_state.dock.from_mock = true;
+        }
+        g_state.pushLog("[Mock] Dock status injected");
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    // Network diagnostics
+    srv.Get("/api/net", [](const httplib::Request&, httplib::Response& res) {
+        NetInfo n = collectNetInfo();
+        std::ostringstream ss;
+        ss << "{"
+           << "\"iface\":"           << jsonStr(n.iface) << ","
+           << "\"ip\":"              << jsonStr(n.ip) << ","
+           << "\"in_dock_subnet\":"  << (n.in_dock_subnet ? "true" : "false") << ","
+           << "\"dock_pingable\":"   << (n.dock_pingable ? "true" : "false")
+           << "}";
+        res.set_content(ss.str(), "application/json");
+    });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -473,30 +806,31 @@ int main(int argc, char** argv) {
     int port = 8080;
     if (argc > 1) port = std::atoi(argv[1]);
 
-    // Init ESDK
-    g_state.pushLog("[DockerHelp] 正在初始化 ESDK...");
-    auto rc = ESDKInit();
-    if (rc != kOk) {
-        g_state.pushLog("[DockerHelp] ESDK 初始化失败，错误码: " + std::to_string(rc));
-        g_state.sdk_init_ok = false;
-    } else {
+    // Run ESDK init on a background thread so the dashboard stays responsive
+    // even while the SDK is still searching for the Dock on 192.168.200.x.
+    std::thread([]{
+        g_state.pushLog("[DockerHelp] 正在初始化 ESDK...");
+        auto rc = ESDKInit();
+        g_state.sdk_init_pending = false;
+        g_state.sdk_init_error = (int)rc;
+        if (rc != kOk) {
+            g_state.pushLog("[DockerHelp] ESDK 初始化失败，错误码: " + std::to_string(rc));
+            g_state.sdk_init_ok = false;
+            return;
+        }
         g_state.sdk_init_ok = true;
-        g_state.pushLog("[DockerHelp] ESDK 初始化成功，等待 Dock2 连接...");
-
-        // Register cloud message handler
+        g_state.pushLog("[DockerHelp] ESDK 初始化成功，等待 Dock 连接...");
         CloudAPI_RegisterCustomServicesMessageHandler(OnCloudMessage);
-
-        // Register media file observer
         MediaManager::Instance()->RegisterMediaFilesObserver(OnNewMediaFile);
-    }
+    }).detach();
 
-    // Start HTTP server
+    // HTTP server starts immediately
     httplib::Server srv;
     setupRoutes(srv);
 
     g_state.pushLog("[DockerHelp] Web 服务启动，访问 http://localhost:" + std::to_string(port));
     printf("\n==============================================\n");
-    printf("  DockerHelp 已启动\n");
+    printf("  DockerHelp 已启动 (Dock 期望网段: 192.168.200.x)\n");
     printf("  浏览器访问: http://localhost:%d\n", port);
     printf("==============================================\n\n");
 

@@ -120,6 +120,6 @@ endif ()
 # ── DockerHelp: DJI Dock2 Web Debug Assistant ──────────────────────────────
 add_executable(dockerhelp examples/dockerhelp/dockerhelp_main.cc)
 target_include_directories(dockerhelp PRIVATE third_party)
-target_link_libraries(dockerhelp ${SAMPLE_LIB} ssl)
+target_link_libraries(dockerhelp ${SAMPLE_LIB} ssl pthread)
 target_compile_options(dockerhelp PRIVATE -Wno-deprecated-declarations)
 
