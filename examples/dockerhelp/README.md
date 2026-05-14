@@ -11,7 +11,7 @@
 ## 1. 启停 dockerhelp
 
 ```bash
-# 编译（第一次或改源码后）
+# 编译
 cmake --build build --target dockerhelp -j$(nproc)
 
 # 前台跑（Ctrl+C 退出）
@@ -48,23 +48,86 @@ pkill -f dockerhelp
 
 ## 2. 一键测试（推荐）
 
-[test_dockerhelp.py](test_dockerhelp.py) 把所有 `/api/*` 端点走一遍，含 L3 连通性、字段校验、边界 case。零依赖（只用 Python stdlib）。
+[test_dockerhelp.py](test_dockerhelp.py) 把所有 `/api/*` 端点走一遍，含 L3 连通性、字段校验、边界 case。零依赖（只用 Python stdlib，需 Python 3.10+）。
+
+### 2.1 启动流程（两个终端）
+
+测试脚本是 HTTP 客户端，**它本身不启动 dockerhelp** —— 你要先让 dockerhelp 跑起来，脚本再去打它。
+
+**终端 A：启动被测服务**
 
 ```bash
-# 只读模式（不污染状态）
-python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080
-
-# 远程测：脚本在 A 机，dockerhelp 在 B 机
-python3 examples/dockerhelp/test_dockerhelp.py 192.168.200.55
-
-# 包含写入测试：注入 mock Dock 数据、发云消息
-python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080 --with-mock
-
-# 详细结果存 JSON
-python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080 --json /tmp/report.json
+cd ~/Desktop/ESDK                                    # 进仓库根目录
+./build/bin/dockerhelp > /tmp/dockerhelp.log 2>&1 &  # 后台跑
+sleep 2                                              # 等 HTTP server 起来
+curl -s --noproxy '*' http://localhost:8080/api/status   # 确认能通
 ```
 
-退出码：全过 = 0，有 FAIL = 1。可放进 CI / Makefile。
+看到类似 `{"sdk_init_ok":false,"sdk_init_pending":...}` 的 JSON 输出就说明 dockerhelp OK。
+
+**终端 B（或同一个终端）：跑测试**
+
+```bash
+cd ~/Desktop/ESDK
+python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080
+```
+
+预期输出：
+
+```
+DockerHelp 一键测试  目标: http://127.0.0.1:8080
+  默认只读模式 (不改状态), 加 --with-mock 启用写入测试
+
+[1/3] L3 连通性
+  [PASS] ping 127.0.0.1
+  [PASS] TCP 127.0.0.1:8080  可连接
+  [PASS] HTTP / (主页)  HTTP 200, 15310 bytes
+[2/3] /api/* 端点
+  [PASS] /api/status  字段齐 (6 项)
+  ...
+══════════════════════════════════════════════
+  16 PASS  0 FAIL  0 SKIP  耗时 1.3s
+══════════════════════════════════════════════
+```
+
+**测完关掉服务**：
+
+```bash
+pkill -f dockerhelp
+```
+
+### 2.2 几种调用姿势
+
+```bash
+# ① 只读模式（默认；不会改 dockerhelp 状态，安全反复跑）
+python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080
+
+# ② 远程测：脚本在 A 机，dockerhelp 跑在 B 机
+python3 examples/dockerhelp/test_dockerhelp.py 192.168.200.55
+python3 examples/dockerhelp/test_dockerhelp.py 192.168.200.55:8080
+
+# ③ 写入测试：注入 mock Dock 数据、试发云消息、试边界 case
+#    会改变 dockerhelp 的 Dock 面板显示，跑完面板会显示 battery=73 mode=test_probe
+python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080 --with-mock
+
+# ④ 把详细结果存成 JSON（含每个 case 的 status/detail + API 快照）
+python3 examples/dockerhelp/test_dockerhelp.py 127.0.0.1:8080 --json /tmp/report.json
+cat /tmp/report.json | python3 -m json.tool | less
+
+# ⑤ 帮助
+python3 examples/dockerhelp/test_dockerhelp.py --help
+```
+
+退出码：全过 = 0，有 FAIL = 1。可直接用在 CI / Makefile / shell 脚本里串测试链。
+
+### 2.3 测试脚本常见报错
+
+| 报错 | 原因 | 处理 |
+|---|---|---|
+| `ConnectionRefusedError: [Errno 111]` | dockerhelp 没跑 / 端口不对 | 先 `pgrep -af dockerhelp` 确认进程，再 `ss -tlnp \| grep 8080` 确认端口 |
+| 所有 case `[FAIL] ping ...` | 目标 IP 不可达 / 防火墙 | 手动 `ping <IP>`，检查防火墙 `sudo iptables -L` |
+| `502 Bad Gateway` | shell 有 `http_proxy` 转发了请求 | `unset http_proxy https_proxy` 或临时 `env -u http_proxy python3 ...` |
+| `SyntaxError` / `match` 关键字报错 | Python < 3.10 | 升级 Python，或 `python3.10 examples/dockerhelp/test_dockerhelp.py ...` |
 
 ---
 
