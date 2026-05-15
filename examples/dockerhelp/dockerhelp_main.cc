@@ -56,6 +56,7 @@ struct AppState {
     std::atomic<bool>        sdk_init_ok{false};
     std::atomic<bool>        sdk_init_pending{true};
     std::atomic<int>         sdk_init_error{0};
+    std::atomic<int64_t>     sdk_init_started_ms{0};  // monotonic ms at init start
     std::string              last_cloud_msg;
     std::mutex               log_mutex;
     std::deque<std::string>  log_lines;       // rolling 200 lines
@@ -194,17 +195,51 @@ static void applyDockJson(const std::string& payload) {
     if (jsonGetNumber(payload, "signal_4g", &nv))   d.signal_4g = (int)nv;
 }
 
-// ─── Network diagnostics (look for 192.168.200.x iface and ping Dock) ────────
+// ─── Network diagnostics ─────────────────────────────────────────────────────
+// Two different IPs matter here, and they don't mean the same thing:
+//   * dock_ip       — the *real* Dock IP on the LAN (default 192.168.200.1,
+//                     overridable via $DOCK_IP). Pinging this checks the
+//                     physical/L2 link. NB: DJI Dock will not answer ICMP
+//                     until ESDK has performed its private-protocol
+//                     handshake, so a "not pingable" here is *expected*
+//                     when sdk_init_ok=false — it is not a wiring fault.
+//   * esdk_peer_ip  — 192.168.200.100, the virtual endpoint ESDK negotiates
+//                     once the handshake succeeds. Reachability here mirrors
+//                     SDK state more closely.
 
 struct NetInfo {
     std::string iface;
     std::string ip;
     bool        in_dock_subnet = false;
-    bool        dock_pingable  = false;   // ping 192.168.200.100 once
+    std::string dock_ip;                  // 192.168.200.1 by default
+    bool        dock_pingable  = false;   // real Dock ICMP echo
+    bool        dock_arp_known = false;   // arp -n shows a MAC for dock_ip
+    bool        esdk_peer_pingable = false;  // 192.168.200.100
 };
+
+static std::string envOr(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : std::string(fallback);
+}
+
+static bool pingOnce(const std::string& ip) {
+    std::string cmd = "ping -c 1 -W 1 " + ip + " >/dev/null 2>&1";
+    return std::system(cmd.c_str()) == 0;
+}
+
+static bool arpHasEntry(const std::string& ip) {
+    // POSIX `arp -n <ip>` prints "(incomplete)" when there's no MAC.
+    // We pipe through grep so an empty / incomplete entry returns non-zero.
+    std::string cmd = "arp -n " + ip +
+                      " 2>/dev/null | grep -qvE '(incomplete|no entry)'"
+                      " && arp -n " + ip + " 2>/dev/null | grep -q ether";
+    return std::system(cmd.c_str()) == 0;
+}
 
 static NetInfo collectNetInfo() {
     NetInfo info;
+    info.dock_ip = envOr("DOCK_IP", "192.168.200.1");
+
     ifaddrs* ifs = nullptr;
     if (getifaddrs(&ifs) == 0) {
         std::string fallback_iface, fallback_ip;
@@ -227,9 +262,9 @@ static NetInfo collectNetInfo() {
         if (info.iface.empty()) { info.iface = fallback_iface; info.ip = fallback_ip; }
         freeifaddrs(ifs);
     }
-    // single-shot ping; 1s timeout
-    int rc = std::system("ping -c 1 -W 1 192.168.200.100 >/dev/null 2>&1");
-    info.dock_pingable = (rc == 0);
+    info.dock_pingable      = pingOnce(info.dock_ip);
+    info.dock_arp_known     = arpHasEntry(info.dock_ip);
+    info.esdk_peer_pingable = pingOnce("192.168.200.100");
     return info;
 }
 
@@ -314,6 +349,29 @@ header h1{font-size:18px;font-weight:600;letter-spacing:.5px}
     </div>
   </div>
 
+  <!-- Pilot 2 绑定指引（仅在 stage = awaiting_pilot_binding 时显示） -->
+  <div id="pilot-bind-card" class="card" style="grid-column:1/-1;display:none;border-color:#d29922">
+    <div class="card-header" style="background:#4a3a1a">
+      <h2 style="color:#d29922">⚠ 等待 DJI Pilot 2 预绑定</h2>
+    </div>
+    <div class="card-body" style="font-size:13px;line-height:1.8">
+      <div style="margin-bottom:10px">
+        ESDK 已经和 Dock 通上私有协议（链路 + 心跳 OK），但卡在<b>会话密钥协商</b>这一步。
+        Dock 需要先在 Pilot 2 里把这个 App 标记为受信任。
+      </div>
+      <div style="margin:8px 0">在手机/平板 DJI Pilot 2 中：</div>
+      <ol style="margin-left:24px;color:#8b949e">
+        <li>用注册了 <b style="color:#e6edf3">App ID 181760 / DockerAssistant</b> 的 DJI 开发者账号登录</li>
+        <li>连上这台 Dock</li>
+        <li>进入 <b style="color:#e6edf3">机场设置 → Edge SDK / 第三方载荷</b></li>
+        <li>选中 <b style="color:#e6edf3">DockerAssistant</b> 完成绑定</li>
+      </ol>
+      <div style="margin-top:10px;color:#8b949e">
+        绑定后无需重启 Dock，但需要重启 dockerhelp 让 ESDK 重新协商 session key。
+      </div>
+    </div>
+  </div>
+
   <!-- Dock 状态 -->
   <div class="card" style="grid-column:1/-1">
     <div class="card-header">
@@ -354,8 +412,11 @@ header h1{font-size:18px;font-weight:600;letter-spacing:.5px}
         <div>本机网卡：<span style="color:#e6edf3" id="n-iface">—</span></div>
         <div>本机 IP：<span style="color:#e6edf3" id="n-ip">—</span></div>
         <div>是否在 Dock 网段 (192.168.200.x)：<span id="n-subnet">—</span></div>
-        <div>能否 ping 通 Dock (192.168.200.100)：<span id="n-ping">—</span></div>
+        <div>ping Dock <span id="n-dock-ip" style="color:#e6edf3">—</span>：<span id="n-ping">—</span></div>
+        <div>ARP 表里有 Dock MAC：<span id="n-arp">—</span></div>
+        <div>ping ESDK 逻辑端点 (.100)：<span id="n-peer">—</span></div>
       </div>
+      <div id="n-hint" style="margin-top:10px;padding:8px 10px;border-radius:6px;font-size:12px;line-height:1.6;display:none"></div>
     </div>
   </div>
 
@@ -415,21 +476,33 @@ async function fetchStatus(){
     const r=await fetch('/api/status');
     const d=await r.json();
     const badge=document.getElementById('sdk-badge');
-    if(d.sdk_init_ok){
-      badge.textContent='SDK 已初始化';
-      badge.className='badge ok';
+    const stageLabel = {
+      authenticating:         'SDK 鉴权中…',
+      handshaking:            'SDK 协议握手中…',
+      awaiting_pilot_binding: '等 Pilot 2 绑定',
+      ready:                  'SDK 已初始化',
+      failed:                 'SDK 初始化失败 (err '+d.sdk_init_error+')',
+    };
+    badge.textContent = stageLabel[d.sdk_init_stage] || 'SDK 状态未知';
+    if(d.sdk_init_stage === 'ready'){
+      badge.className='badge ok'; badge.classList.remove('pulse');
+    } else if(d.sdk_init_stage === 'failed' || d.sdk_init_stage === 'awaiting_pilot_binding'){
+      badge.className = (d.sdk_init_stage === 'failed') ? 'badge err' : 'badge warn';
       badge.classList.remove('pulse');
-    } else if(d.sdk_init_pending){
-      badge.textContent='SDK 初始化中…';
-      badge.className='badge warn pulse';
     } else {
-      badge.textContent='SDK 初始化失败 (err '+d.sdk_init_error+')';
-      badge.className='badge err';
-      badge.classList.remove('pulse');
+      badge.className='badge warn pulse';
     }
     document.getElementById('stat-conn').textContent =
       d.sdk_init_ok ? '✓ 已连接'
-                    : (d.sdk_init_pending ? '⏳ 等待' : '✗ 失败');
+                    : (d.sdk_init_pending ? '⏳ '+(stageLabel[d.sdk_init_stage]||'…') : '✗ 失败');
+
+    // Stage 5 of 5 — RSA session-key negotiation. The SDK loops on this
+    // forever until the App is pre-bound in Pilot 2, so surface explicit
+    // guidance instead of leaving the user staring at a spinner.
+    const binder = document.getElementById('pilot-bind-card');
+    if(binder){
+      binder.style.display = (d.sdk_init_stage === 'awaiting_pilot_binding') ? 'block' : 'none';
+    }
     document.getElementById('stat-files').textContent = d.media_count;
     document.getElementById('stat-msgs').textContent = d.cloud_msg_count;
   }catch(e){}
@@ -542,14 +615,46 @@ async function fetchNet(){
   try{
     const r=await fetch('/api/net');
     const d=await r.json();
-    document.getElementById('n-iface').textContent = d.iface||'(none)';
-    document.getElementById('n-ip').textContent    = d.ip||'(none)';
+    document.getElementById('n-iface').textContent   = d.iface||'(none)';
+    document.getElementById('n-ip').textContent      = d.ip||'(none)';
+    document.getElementById('n-dock-ip').textContent = d.dock_ip||'192.168.200.1';
+
     const sn=document.getElementById('n-subnet');
     sn.textContent = d.in_dock_subnet?'✓ 是':'✗ 否（需配置 192.168.200.x）';
     sn.style.color = d.in_dock_subnet?'#3fb950':'#f85149';
+
     const pg=document.getElementById('n-ping');
     pg.textContent = d.dock_pingable?'✓ 通':'✗ 不通';
-    pg.style.color = d.dock_pingable?'#3fb950':'#f85149';
+    pg.style.color = d.dock_pingable?'#3fb950':(d.sdk_init_ok?'#f85149':'#d29922');
+
+    const ar=document.getElementById('n-arp');
+    ar.textContent = d.dock_arp_known?'✓ 有':'✗ 无';
+    ar.style.color = d.dock_arp_known?'#3fb950':(d.sdk_init_ok?'#f85149':'#d29922');
+
+    const pe=document.getElementById('n-peer');
+    pe.textContent = d.esdk_peer_pingable?'✓ 通':'✗ 不通';
+    pe.style.color = d.esdk_peer_pingable?'#3fb950':(d.sdk_init_ok?'#f85149':'#d29922');
+
+    // Contextual interpretation: a "not pingable" reading means very
+    // different things depending on whether ESDK has handshaked yet.
+    const hint=document.getElementById('n-hint');
+    if(!d.in_dock_subnet){
+      hint.style.display='block';
+      hint.style.background='#4a1a1a';hint.style.color='#f85149';
+      hint.innerHTML='本机不在 Dock 网段。先把网卡配成 <code>192.168.200.x</code>，否则 ping/ARP 一定失败。';
+    } else if(d.dock_pingable && d.esdk_peer_pingable){
+      hint.style.display='block';
+      hint.style.background='#1a4a2e';hint.style.color='#3fb950';
+      hint.innerHTML='✓ 物理链路与 ESDK 握手均正常。';
+    } else if(!d.sdk_init_ok){
+      hint.style.display='block';
+      hint.style.background='#4a3a1a';hint.style.color='#d29922';
+      hint.innerHTML='ping 不通是<b>预期行为</b>：DJI Dock 在 ESDK 握手成功前默认不响应 ICMP/ARP。<br>等 SDK 初始化完成（顶部徽章变绿）后再看这里。';
+    } else {
+      hint.style.display='block';
+      hint.style.background='#4a1a1a';hint.style.color='#f85149';
+      hint.innerHTML='SDK 已初始化但仍 ping 不通 Dock。检查：网线、Dock 是否上电、防火墙、ARP 是否被劫持。';
+    }
   }catch(e){}
 }
 
@@ -622,10 +727,30 @@ static void setupRoutes(httplib::Server& srv) {
             std::lock_guard<std::mutex> lk(g_state.cloud_mutex);
             cloud_count = (int)g_state.cloud_messages.size();
         }
+        // Stage hint for the UI. ESDK does not expose its internal state
+        // machine, so we infer from (init_ok / pending / error / elapsed_ms).
+        // The 30s threshold matches what we observed: protocol handshake
+        // completes well within 30s; anything past that is the SDK looping
+        // on RequestSessionKey waiting for a Pilot 2 binding.
+        const char* stage;
+        int64_t elapsed = 0;
+        if (g_state.sdk_init_started_ms > 0) {
+            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            elapsed = now - g_state.sdk_init_started_ms;
+        }
+        if (g_state.sdk_init_ok)              stage = "ready";
+        else if (!g_state.sdk_init_pending)   stage = "failed";
+        else if (elapsed < 2000)              stage = "authenticating";
+        else if (elapsed < 30000)             stage = "handshaking";
+        else                                  stage = "awaiting_pilot_binding";
+
         ss << "{"
            << "\"sdk_init_ok\":" << (g_state.sdk_init_ok ? "true" : "false") << ","
            << "\"sdk_init_pending\":" << (g_state.sdk_init_pending ? "true" : "false") << ","
            << "\"sdk_init_error\":" << g_state.sdk_init_error.load() << ","
+           << "\"sdk_init_stage\":" << jsonStr(stage) << ","
+           << "\"sdk_init_elapsed_ms\":" << elapsed << ","
            << "\"sdk_connected\":" << (g_state.sdk_connected ? "true" : "false") << ","
            << "\"media_count\":" << media_count << ","
            << "\"cloud_msg_count\":" << cloud_count
@@ -798,10 +923,14 @@ static void setupRoutes(httplib::Server& srv) {
         NetInfo n = collectNetInfo();
         std::ostringstream ss;
         ss << "{"
-           << "\"iface\":"           << jsonStr(n.iface) << ","
-           << "\"ip\":"              << jsonStr(n.ip) << ","
-           << "\"in_dock_subnet\":"  << (n.in_dock_subnet ? "true" : "false") << ","
-           << "\"dock_pingable\":"   << (n.dock_pingable ? "true" : "false")
+           << "\"iface\":"               << jsonStr(n.iface) << ","
+           << "\"ip\":"                  << jsonStr(n.ip) << ","
+           << "\"in_dock_subnet\":"      << (n.in_dock_subnet ? "true" : "false") << ","
+           << "\"dock_ip\":"             << jsonStr(n.dock_ip) << ","
+           << "\"dock_pingable\":"       << (n.dock_pingable ? "true" : "false") << ","
+           << "\"dock_arp_known\":"      << (n.dock_arp_known ? "true" : "false") << ","
+           << "\"esdk_peer_pingable\":"  << (n.esdk_peer_pingable ? "true" : "false") << ","
+           << "\"sdk_init_ok\":"         << (g_state.sdk_init_ok ? "true" : "false")
            << "}";
         res.set_content(ss.str(), "application/json");
     });
@@ -809,14 +938,42 @@ static void setupRoutes(httplib::Server& srv) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// Write a one-line file. Used to drop in /tmp/test_remote_ip and
+// /tmp/test_local_ip — an undocumented override hook DJI compiled into
+// libedgesdk.a that lets us replace the hardcoded .100 / .55 endpoints.
+static void writeOneLineFile(const std::string& path, const std::string& value) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "%s\n", value.c_str());
+    std::fclose(f);
+}
+
+// If env DOCK_REMOTE_IP / DOCK_LOCAL_IP are set, plant the override files
+// the SDK reads on startup. Defaults match the values we verified work
+// against a real Dock connected through a router: remote=.1 (the actual
+// Dock IP on the LAN), local=.55 (the source IP the Dock whitelists).
+static void applyEsdkIpOverride() {
+    std::string remote = envOr("DOCK_REMOTE_IP", "192.168.200.1");
+    std::string local  = envOr("DOCK_LOCAL_IP",  "192.168.200.55");
+    writeOneLineFile("/tmp/test_remote_ip", remote);
+    writeOneLineFile("/tmp/test_local_ip",  local);
+    g_state.pushLog("[DockerHelp] ESDK 链路 IP 覆盖: local=" + local +
+                    " remote=" + remote);
+}
+
 int main(int argc, char** argv) {
     int port = 8080;
     if (argc > 1) port = std::atoi(argv[1]);
+
+    // Plant the IP override files *before* ESDKInit reads them.
+    applyEsdkIpOverride();
 
     // Run ESDK init on a background thread so the dashboard stays responsive
     // even while the SDK is still searching for the Dock on 192.168.200.x.
     std::thread([]{
         g_state.pushLog("[DockerHelp] 正在初始化 ESDK...");
+        g_state.sdk_init_started_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         auto rc = ESDKInit();
         g_state.sdk_init_pending = false;
         g_state.sdk_init_error = (int)rc;

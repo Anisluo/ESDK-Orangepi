@@ -197,12 +197,80 @@ curl -s --noproxy '*' http://localhost:8080/api/net | python3 -m json.tool
 
 ---
 
-## 4. 快速排错
+## 4. ESDK 初始化五关诊断
+
+ESDK 从 `ESDKInit()` 调用到能拿到 Dock 状态，要过 5 个关卡。卡在哪一关，处理方式完全不同。`/api/status` 的 `sdk_init_stage` 字段会告诉你当前在哪。
+
+| stage | 含义 | 通过标志 | 卡住时的处理 |
+|---|---|---|---|
+| `authenticating` | 验证 App ID/Key/License | 日志：`Application info verify successfully` | 检查 [examples/init/app_info.h](../init/app_info.h) 凭证 |
+| `handshaking` | 与 Dock 走 PSDK 私有协议握手 | 日志出现 `V1-Recv: 0xA6->0xF6` | 检查 IP 覆盖（见下面 4.1），检查 Dock 是否上电 |
+| `awaiting_pilot_binding` | 等 Pilot 2 给 App 预绑定授权 | 日志：`Updating session key...` 停止刷屏 | 用 DJI Pilot 2 绑定（见 4.2） |
+| `ready` | SDK 完全就位 | `sdk_init_ok=true` | 可以收 `/api/cloud_messages`、拉 `/api/media` |
+| `failed` | `ESDKInit` 返回非 0 | `sdk_init_error` 非 0 | 看 `sdk_init_error` 错误码 |
+
+### 4.1 IP 覆盖机制（绕开 ESDK 默认 .55/.100）
+
+ESDK 默认假设："PSDK 物理网口直连，本机 .55，对端 .100"。**但如果你的 Dock 在普通 LAN 里**（比如通过路由器、USB 网卡），真实 IP 通常不是 .100。
+
+DJI 在 libedgesdk.a 里留了一个**文件覆盖通道**：
+
+```
+/tmp/test_remote_ip   ← Dock 真实 IP (默认 192.168.200.1)
+/tmp/test_local_ip    ← 本机 IP (默认 192.168.200.55)
+```
+
+dockerhelp **启动时自动写这两个文件**，所以一般不用管。要自定义，启动前设环境变量：
+
+```bash
+DOCK_REMOTE_IP=192.168.200.1 \
+DOCK_LOCAL_IP=192.168.200.55 \
+./build/bin/dockerhelp
+```
+
+**关键约束**：`DOCK_LOCAL_IP` 必须真的在你机器上（用 `ip addr add` 加副地址）；Dock 仍然只接受源 IP = `192.168.200.55`，**不能用 DHCP 拿到的随机 IP**（Dock 协议层白名单）。
+
+加副 IP 的命令：
+
+```bash
+# 假设你的 USB 网卡叫 enxXXXX
+sudo ip addr add 192.168.200.55/24 dev enxXXXX
+```
+
+### 4.2 在 DJI Pilot 2 里预绑定 App
+
+ESDK 协议握手成功后，**Dock 仍然不会发任何数据**给你 —— 它要求云端在 Pilot 2 里**预绑定**你这个 App。
+
+操作：
+
+1. 用注册了你 App ID 的**开发者账号**登录 DJI Pilot 2
+2. Pilot 2 连上这台 Dock
+3. **机场设置 → Edge SDK / 第三方载荷管理**
+4. 选中你的 App（名字看 `app_info.h` 里的 `USER_APP_NAME`）→ **绑定 / 启用**
+
+绑完后**不用重启 Dock**，但 dockerhelp 需要重启让 ESDK 重新协商 session key。
+
+绑定卡住时，dockerhelp Web 面板会自动弹出黄色提示卡告诉你怎么做（基于 `sdk_init_stage = awaiting_pilot_binding` 自动判断）。
+
+### 4.3 关于 "ping 不通 Dock"
+
+**这是预期行为，不是 bug**。DJI Dock 不响应 ICMP，只响应自家 PSDK 协议。判断"链路通不通"的真正标志：
+
+- ❌ ping 192.168.200.1：永远 100% 丢包，**正常**
+- ✅ `ip neigh | grep 200.1`：能看到 Dock 的 MAC 地址 = L2 通
+- ✅ ESDK 日志出现 `V1-Recv: 0xA6->0xF6` = 协议层通
+
+---
+
+## 5. 快速排错
+
+> 看 §4 的"初始化五关"判断 ESDK 卡在哪。这一节是其他通用问题。
 
 | 现象 | 大概率原因 | 处理 |
 |---|---|---|
 | 浏览器 / curl 卡住 502 | shell 有 `http_proxy` | 加 `--noproxy '*'`，或 `unset http_proxy https_proxy` |
-| 控制台一直 `Command async send retry, cmdSet=60` | Dock 没接 / 网段不对 | 看 `/api/net`：`in_dock_subnet` 必须 `true`，`dock_pingable` 必须 `true` |
+| 持续 `cmdSet=60 retry`，**无 V1-Recv** | 协议握手未完成 | 检查 IP 覆盖（§4.1）、Dock 是否上电、ARP `ip neigh \| grep 200.1` 是否有 MAC |
+| 持续 `Updating session key...` | 卡在 §4.2 预绑定 | 去 Pilot 2 绑 App，重启 dockerhelp |
 | `Edge sdk init failed: 11` | `app_info.h` 是占位符或凭证不对 | 填回真实 `APP_ID/KEY/LICENSE` 重编译 |
 | `/api/dock` 一直 `valid=false` | 云端没下发 `{"type":"dock_osd",...}` | 用 `/api/dock/inject` 先验证面板，再配置云端透传 |
 | 进程 exit 139 (segfault) | 撞到了已知边界（理论上已修） | 用 `dmesg | tail` 看 core，参考 [test_dockerhelp.py](test_dockerhelp.py) 的边界 case 复现 |
@@ -213,23 +281,21 @@ curl -s --noproxy '*' http://localhost:8080/api/net | python3 -m json.tool
 # 看当前网卡和 IP
 ip -br addr
 
-# 临时切到 Dock 网段（重启失效）
-sudo ip addr flush dev ens33
-sudo ip addr add 192.168.200.55/24 dev ens33
-sudo ip link set ens33 up
-
-# 验证能不能 ping 通 Dock
-ping -c 3 192.168.200.100
+# 给 Dock 网段加副地址 (保留 DHCP 的主 IP)
+# 把 enxXXXX 换成你 USB/物理网卡名
+sudo ip addr add 192.168.200.55/24 dev enxXXXX
 ```
+
+> ping Dock 永远不通 —— 看 §4.3 解释，判断链路用 ESDK 日志或 `ip neigh`。
 
 ---
 
-## 5. 端点速查表
+## 6. 端点速查表
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET  | `/`                     | Web 面板 HTML |
-| GET  | `/api/status`           | SDK 初始化 / 连接状态 |
+| GET  | `/api/status`           | SDK 初始化 / 连接状态。含 `sdk_init_stage`: `authenticating` / `handshaking` / `awaiting_pilot_binding` / `ready` / `failed`，及 `sdk_init_elapsed_ms` |
 | GET  | `/api/logs`             | 实时日志（滚动 200） |
 | POST | `/api/logs/clear`       | 清空日志 |
 | GET  | `/api/cloud_messages`   | 收到的云消息（滚动 50） |
@@ -237,7 +303,7 @@ ping -c 3 192.168.200.100
 | GET  | `/api/media`            | 飞机媒体文件列表（触发 SDK 拉取） |
 | GET  | `/api/dock`             | 当前 Dock OSD 数据 |
 | POST | `/api/dock/inject`      | 注入测试 OSD 数据，body 为 dock_osd JSON 或空（用默认） |
-| GET  | `/api/net`              | 本机网卡 + ping Dock 结果 |
+| GET  | `/api/net`              | 本机网卡 + ping Dock 结果。可用 `DOCK_IP` 环境变量覆盖目标 IP |
 
 ### Dock OSD 透传 JSON 约定
 
